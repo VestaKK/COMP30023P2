@@ -1,0 +1,344 @@
+Matthew Thao Dang Pham
+MATTHEWTP
+1273607
+
+QUESTION SECTION
+
+1. Should the server accept calls from everyone, or just a subset of users?
+    :: In the project, the server will connect with pretty much any user who connects 
+        with the server. In real life, it would be preferable to limit the set of users
+        to a list of verifiable/authenticated machines.
+
+2. Should authentication etc. be provided by the RPC framework, or by the 
+    function that use the RPC framework?
+    :: Ideally, authentication is provided by the RPC framework (machines that have 
+        connected to the server can only communicate to the server i.e. try to prevent 
+        message interception), as well as additional authentication for the functions 
+        using the framework (login information, key exchange etc.)
+
+3. What transport layer protocol should be used? what are the trade-offs?
+    :: The RPC system should use TCP:
+        - Pros:
+            :: Maintains an on-going connection between machines
+            :: Ensures that data is consistent and not lost, and is generally more
+                reliable than other protocols
+            :: Abstracts the scanning of individual packets so we can focus on a contiguous
+                byte stream.
+        - Cons:
+            :: Relatively slow compared to other protocols, due to its reliability
+            :: Will prevent a packet from being sent if a some data is lost, meaning
+                connections with many lost packets will be greatly interupted.
+
+4. In which function(s) should the socket(s) be created?
+    :: The sockets should be created in the rpc_init_xxx() functions.
+
+5. Should rpc_client and rpc_server be allocated dynamically or statically? 
+    What are the implications for the client and server code?
+    :: Dynamically - allocating memory in some static/global scope would mean state
+        used for the server would be present on the client and vice versa (that's probably a 
+        bad thing). Additionally, applications might have other functionality not related 
+        to the RPC system, so we should properly encapsulate server/client state.
+
+6. What happens if on host uses big-endian byte order and the other uses little 
+    endian? How does that relate to "network byte order"?
+    :: Different byte orders on different machines will mean the data will have to be
+        adjusted in order to be processed properly. If we send data in network byte order,
+        we can leave the process of converting network data to the machine and not the RPC 
+        system.
+
+PROTOCOL SECTION
+
+Protocol Choice: [TCP]
+    :: This protocol uses TCP for two main reasons:
+         - It is designed to minimise packet loss and duplication
+         - You can abstract individual packets of information into a byte stream
+         - Single, continuous connection between server and client. 
+
+    :: There are a few cons here though:
+         - Speed of data transfer is slow, because of error checking and header information 
+         - If data is lost somehow, it will prevent any other data from being sent through.
+            This is perfect for a system that must be reliable, but for a system that just needs
+            to be fast and doesn't care about the order of packets, this is unnecessary
+
+    :: The protocol wouldn't use UDP for pretty much the opposite reasons:
+         -  Data is not guaranteed to be complete when delivered
+         -  Not connection based, so source of information is unknown
+         -  Data is not sequenced in any particular order
+
+    :: There are a few pros with using UDP:
+         - Speed of data transfer is faster than TCP
+         - Packets are sent regardless of packet loss
+         - Allows machine to send a packet of data to many sources
+
+Protocol Design:
+
+:: Packets, Messages, Errors and Data
+
+    All data transfered between the server and client consists of packets. Each packet 
+    begins with a message describing a certain request/procedure, and ends with an "end" message.
+
+    Messages are listed below accordingly.
+
+    enum RPC_MESSAGE {
+        RPC_MSG_CONNECT = 0xCC,
+        RPC_MSG_FUNC_FIND = 0xFF,
+        RPC_MSG_FUNC_CALL = 0xFC,
+        RPC_MSG_DISCONNECT = 0xDC,
+        RPC_MSG_END = 0xED,
+        RPC_RTN_SUCCESS = 0x55,
+        RPC_RTN_ERROR = 0xEE,
+    };
+
+    A message is simply a byte-integer with a meaning that both the client and server can agree upon.
+    For the client, a packet can lead with any message, but must end with RPC_MSG_END. A packet that 
+    begins with a certain message should contain a certain layout of data, which is specific to each 
+    message. For some messages, this packet layout is fixed-length, for others this is variable-length.
+
+    When sending a packet to a server, the client should recieve a packet back. The beginning of this
+    packet will either be a RPC_RTN_SUCCESS or RPC_RTN_ERROR. A successful return will contain
+    known data related to the initial message sent. An error return will always be followed by 
+    another byte with error bit-flags, which the client can check to handle any errors. Again, each
+    of these packets will end in RPC_MSG_END. Both ends can check the validity of the packets sent by 
+    checking the last byte read is RPC_MSG_END.
+
+    Error flags are listed below accordingly.
+
+    enum RPC_ERROR {
+        RPC_ERROR_NONE = 0x0,
+        RPC_ERROR_CXN_INVALID = 0x1,
+        RPC_ERROR_FUNC_NOT_FOUND = 0x2,
+        RPC_ERROR_DATA_INT_OVF = 0x4,
+        RPC_ERROR_DATA_BUFF_OVF = 0x8,
+        RPC_ERROR_DATA_INVALID = 0x10,
+        RPC_ERROR_HNDL_INVALID = 0x20,
+        RPC_ERROR_MSG_INVALID = 0x40,
+        RPC_ERROR_PQT_INVALID = 0x80,
+    };
+
+    If any packet contains information related to rpc_data, the data itself must be preceeded 
+    with a byte containing data bit-flags that describe the stored data. The data itself must be 
+    ordered in order of data1, then data2_len, and then the bytes in data2. The fields that 
+    correspond to data1 and data2_len are both 64-bit fields (signed and unsigned respectively), while 
+    the bytes corresponding to data2 is of the same length as data2_len.
+
+    Data flags are listed below accordingly.
+
+    enum RPC_DATA_FLAG {
+        RPC_DATA_NONE = 0x0,
+        RPC_DATA_INT = 0x1,
+        RPC_DATA_BUFF = 0x80,
+    };
+
+:: RPC_MESSAGE Packets
+
+    Packets are formatted such that they can be parsed linearly; most data elements in a packet are 
+    fixed length. If a packet contains a variable length data element, this element will be preceeded 
+    by a value indicating its length so it can be parsed in accordingly. Where size > 1 and is fixed, 
+    the data will be in network byte order.
+
+    [CLIENT -> SERVER]
+
+     - RPC_MSG_CONNECT
+        (Client is initialising a connection to a server)
+
+        :: Packet Contents (4 bytes):
+            { size: 1, value: RPC_MSG_CONNECT }
+            { size: 1, value: sizeof(int)     } 
+            { size: 1, value: sizeof(size_t)  } 
+            { size: 1, value: RPC_MSG_END     }
+
+        :: Return on Success (4 bytes):
+            { size: 1, value: RPC_RTN_SUCCESS }
+            { size: 1, value: sizeof(int)     } 
+            { size: 1, value: sizeof(size_t)  } 
+            { size: 1, value: RPC_MSG_END     }
+
+        :: Possible error return flags:
+            RPC_ERROR_PQT_INVALID
+
+        :: Notes:
+             - The client MUST send this message before attempting to use other messages, ideally this 
+                is the first message sent to the server proceeding the connection to the server. Otherwise, 
+                trying to send other messages will result in the server sending an RPC_ERROR_CXN_INVALID.
+
+             - The client sends the size of their int and size_t in bytes, and receives the size of the 
+                server's int and size_t in bytes. The client is expected to use these returned values to 
+                calculate the int_max, int_min and size_max of the server, and use these values to ensure 
+                any rpc_data sent to the server will not overflow on the server's machine. The server will 
+                do the same for rpc_data sent to the client. 
+
+
+     - RPC_MSG_FUNC_FIND
+        (Client wants to find a function on the server)
+
+        :: Packet Contents (variable):
+            { size: 1, value: RPC_MSG_FUNC_FIND }
+            { size: 2, value: len_name          }
+            { size: len_name, buffer: func_name }
+            { size: 1, value: RPC_MSG_END       }
+
+        :: Return on Success (10 bytes):
+            { size: 1, value: RPC_RTN_SUCCESS      }
+            { size: 8, value: 64-bit int func hash }
+            { size: 1, value: RPC_MSG_END          }
+
+        :: Possible error return flags:
+            RPC_ERROR_PQT_INVALID
+            RPC_ERROR_CXN_INVALID
+            RPC_ERROR_FUNC_NOT_FOUND
+
+        :: Notes:
+             - Name sent by the client is assumed to be an ASCII string. The client should NOT send the
+                null terminating byte at the end of the string. Implies that len_name also does not include
+                the null terminating byte.
+
+             - The length of the name sent by the client must be less than MAX(uint16).
+                This is because its fairly unreasonable to have a name length be larger than
+                65535 bytes.
+
+
+     - RPC_MSG_FUNC_CALL
+        (Client wants to call a function on server with an rpc_data)
+
+        :: Packet Contents (variable):
+            { size: 1, value: RPC_MSG_FUNC_CALL }
+            { size: 1, value: rpc_data_flags    }
+
+            ----------[start of rpc_data]----------
+            | #IF (data_flags & RPC_DATA_INT):    |
+            | { size: 8, value: data1           } |
+            | #END                                |
+            | #IF (data_flags & RPC_DATA_BUFF):   |
+            | { size: 8, value: data2_len       } |
+            | { size: data2_len, buffer: data2  } |
+            | #END                                |
+            -----------[end of rpc_data]-----------
+
+            { size: 8, value: 64-bit func hash  }
+            { size: 1, value: RPC_MSG_END       }
+
+        :: Return on Success (variable):
+            { size: 1, value: RPC_RTN_SUCCESS   } 
+            { size: 1, value: rpc_data_flags    }
+
+            ----------[start of rpc_data]----------
+            | #IF (data_flags & RPC_DATA_INT):    |
+            | { size: 8, value: data1           } | 
+            | #END                                |
+            | #IF (data_flags & RPC_DATA_BUFF):   |
+            | { size: 8, value: data2_len       } |
+            | { size: data2_len, buffer: data2  } |
+            | #END                                |
+            -----------[end of rpc_data]-----------
+
+            { size: 8, value: 64-bit int hash   }
+            { size: 1, value: RPC_MSG_END       }
+
+        :: Possible error return flags:
+            RPC_ERROR_PQT_INVALID
+            RPC_ERROR_CXN_INVALID
+            RPC_ERROR_DATA_BUFF_OVF
+            RPC_ERROR_DATA_INT_OVF
+            RPC_ERROR_DATA_INVALID
+            RPC_ERROR_HNDL_INVALID
+
+        :: Notes:
+             - Client and server should use data_flags to dynamically read in the fields
+                of rpc_data. 
+            
+             - The order of rpc_data is always data1, then data2_len, and then a variable length
+                buffer of bytes (given that these fields exist). 
+
+             - Any rpc_data sent must be checked by the side sending the data using the data sent
+
+    - RPC_MSG_DISCONNECT:
+        (Client is disconnecting from server)
+
+        :: Packet Contents (1 byte):
+            { size: 1, value: RPC_MSG_DISCONNECT }
+
+        :: Return on Success (0 byte):
+
+        :: Note: 
+            Client should close socket immediately after sending this message. Same for the server
+            receiving this message.
+    
+    [SERVER -> CLIENT]
+
+     - RPC_RTN_SUCCESS:
+        (Different for client->server message. Look above)
+
+     - RPC_RTN_ERROR:
+        (Returned by a client->server message if an error has occured)
+
+        :: Packet Contents (3 bytes):
+            { size: 1, value: RPC_RTN_ERROR }
+            { size: 1, value: rpc_error bit flags }
+            { size: 1, value: RPC_MSG_END }
+
+:: Typical Loop
+
+    Here is an example of a normal interaction between server and client, using the message descriptions above,
+    ( "L -> R" means L sends R data and R reads the data in ). The curly braces match the data elements that are
+    described by each message above.
+
+    1.
+        client -> server: { RPC_MSG_CONNECT } { sizeof(int) } { sizeof(size_t) } { RPC_MSG_END }
+        server -> client: { RPC_RTN_SUCCESS } { sizeof(int) } { sizeof(size_t) } { RPC_MSG_END }
+
+    2.
+        client -> server: { RPC_MSG_FUNC_FIND } { 4, ['a','d','d','2'] } { RPC_MSG_END }
+        server -> client: { RPC_RTN_SUCCESS } { 0x1234567890ABCDEF } { RPC_MSG_END }
+
+    3.
+        client -> server: { RPC_MSG_FUNC_CALL } 
+                          { RPC_DATA_INT | RPC_DATA_BUFF } 
+                          { 1, 1, [01] } 
+                          { 0x1234567890ABCDEF } 
+                          { RPC_MSG_END }
+
+        server -> client: { RPC_RTN_SUCCESS }
+                          { RPC_DATA_INT } 
+                          { 2 } 
+                          { RPC_MSG_END }
+
+    4.
+        client -> server: { RPC_MSG_DISCONNECT }
+ 
+    ERROR.
+        server -> client: { RPC_RTN_ERROR } { RPC_ERROR_PQT_INVALID } { RPC_MSG_END }
+
+    Byte data representation of the above:
+
+    1. 
+        client -> server: { CC } { 04,} { 08 } { ED }
+        server -> client: { 55 } { 04,} { 08 } { ED }
+
+    2.
+        client -> server: { FF } { 00, 04, 61, 64, 64, 32 } { ED }
+        server -> client: { 55 } { 12, 34, 56, 78, 90, AB, CD, EF } { ED }
+
+    3. 
+        client -> server: { FC } 
+                          { 81 } 
+                          { 00, 00, 00, 00, 00, 00, 00, 01, 
+                            00, 00, 00, 00, 00, 00, 00, 01, 
+                            01 } 
+                          { 12, 34, 56, 78, 90, AB, CD, EF } 
+                          { ED }
+
+        server -> client: { 55 } 
+                          { 01 }
+                          { 00, 00, 00, 00, 00, 00, 00, 01 } 
+                          { ED }
+
+    4. 
+        client -> server: { DC }
+
+
+    ERROR.
+        server -> client: { EE } { 80 } { ED }  
+
+    
+
+
